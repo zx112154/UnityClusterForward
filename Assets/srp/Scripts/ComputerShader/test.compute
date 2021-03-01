@@ -1,0 +1,23 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+struct Data {
+	float A;
+	float B;
+	float C;
+};
+
+//从CPU写进来的资料(CPU->GPU)
+StructuredBuffer<Data> inputData;
+
+//outputData 之后会丢回CPU(GPU->CPU)
+RWStructuredBuffer<Data> outputData;
+
+[numthreads(12, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+	//计算完后丢回CPU
+	outputData[id.x].A = inputData[id.x].A * 2;
+	outputData[id.x].B = inputData[id.x].B * 2;
+	outputData[id.x].C = inputData[id.x].C * 2;
+}

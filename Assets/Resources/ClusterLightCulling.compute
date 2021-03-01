@@ -1,0 +1,235 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ClusterLightCulling
+
+#define LIGHT_TYPE_SPOT 0
+#define LIGHT_TYPE_DIRECTIONAL 1
+#define LIGHT_TYPE_POINT 2
+
+#define NUM_THREADS 1024
+
+//原子操作，不会被线程调度机制打断
+//保证lightList在线程操作时不会被其他访问
+//index = 输出累加值
+#define AppendLight(_lightIndex, _counter, _lightList) \
+		InterlockedAdd(_counter, 1, index); \
+		if(index < 1024) \
+			_lightList[index] = _lightIndex;
+
+struct SPlane
+{
+	float3 n;
+	float d;
+};
+
+struct SFrustum
+{
+	SPlane planes[4];
+	float2 nearFar;
+};
+
+struct SSphere
+{
+	float3 c;
+	float r;
+};
+
+//圆锥
+struct SCone
+{
+	float3 t;		//top
+	float h;		//height
+	float3 d;		//direction
+	float r;		//radius
+};
+
+struct SLight
+{
+	float3 pos;
+	float3 direction;
+	float3 color;
+	float spotAngle;
+	float range;
+	uint type;
+};
+
+struct CSInput
+{
+	uint3 groupId : SV_GroupID;
+	uint3 dispatchThreadId : SV_DispatchThreadID;
+	uint3 groupdThreadID : SV_GroupThreadID;
+	uint groupIndex : SV_GroupIndex;
+};
+
+StructuredBuffer<SLight> g_lights;		//光源数据
+StructuredBuffer<SFrustum> g_clusters;	//分块数据
+
+RWStructuredBuffer<uint> g_pointLightIndexCounter;
+RWStructuredBuffer<uint> g_lightIndexList;
+RWStructuredBuffer<uint2> g_lightGrid;
+
+float4x4 _CameraViewMatrix;
+uint g_lightCount;
+uint3 clusterCount;
+
+//线程组共享数据
+groupshared uint clusterIndex1d;
+groupshared SFrustum cluster;
+groupshared	uint lightCount;
+groupshared uint lightStartOffset;
+groupshared uint lightList[NUM_THREADS];
+groupshared uint totalLightCount;
+
+bool pointInsidePlane(float3 _p, SPlane _plane)
+{
+	return dot(_plane.n, _p) - _plane.d < 0;
+}
+
+//判断圆锥是否在边界点外
+bool coneInsidePlane(SCone _cone, SPlane _plane)
+{
+	//获取圆锥边界点
+	float3 m = normalize(cross(normalize(cross(_plane.n, _cone.d)), _cone.d));
+	float3 q = _cone.t + _cone.d * _cone.h - m * _cone.r;	//br
+
+	return pointInsidePlane(_cone.t, _plane) && pointInsidePlane(q, _plane);
+}
+
+//判断聚光灯是否在裁剪面内
+bool coneInsideFrustum(SCone _cone, SFrustum _frustum)
+{
+	bool result = true;
+
+	//构建裁剪面
+	SPlane nearPlane = { float3(0, 0, -1), -_frustum.nearFar.x };
+	SPlane farPlane = { float3(0, 0, 1), _frustum.nearFar.y };
+
+	if (coneInsidePlane(_cone, nearPlane) || coneInsidePlane(_cone, farPlane))
+	{
+		result = false;
+	}
+
+	for (int i = 0; i < 4 && result; i++)
+	{
+		if (coneInsidePlane(_cone, _frustum.planes[i]))
+			result = false;
+	}
+
+	return result;
+}
+
+//世界->相机
+float4 worldToView(float4 _posWorld)
+{
+	float4 posView = mul(_CameraViewMatrix, _posWorld);
+	return posView;
+}
+
+//判断球在平面上方还是下方
+bool sphereInsidePlane(SSphere _sphere, SPlane _plane)
+{
+	return dot(_plane.n, _sphere.c) - _plane.d >= -_sphere.r;
+}
+
+//判断点光源是否在裁剪面内
+bool sphereInsideFrustum(SSphere _sphere, SFrustum _frustum)
+{
+	bool result = true;
+
+	float zNear = _frustum.nearFar.x;
+	float zFar = _frustum.nearFar.y;
+
+
+	if (_sphere.c.z - _sphere.r > zNear || _sphere.c.z + _sphere.r < zFar)
+	{
+		result = false;
+	}
+
+	for (int i = 0; i < 4 && result; i++)
+	{
+		if (!sphereInsidePlane(_sphere, _frustum.planes[i]))
+		{
+			result = false;
+		}
+	}
+
+	return result;
+}
+
+[numthreads(NUM_THREADS, 1, 1)]
+void ClusterLightCulling(CSInput input)
+{
+	uint index = 0, clusterIndex1d = 0;
+	//当前线程组，第一个线程，初始化数据
+	if (input.groupIndex == 0)
+	{
+		lightCount = 0;							//光源计数
+		totalLightCount = g_lightCount;			//光源总数
+		clusterIndex1d = input.groupId.x;		//当前线程组的ID
+		cluster = g_clusters[clusterIndex1d];	//根据根据线程组ID获取分块信息
+	}
+
+	//等待初始化共享数据完成
+	//等待对GroupShader的访问 和指令同步
+	GroupMemoryBarrierWithGroupSync();
+
+	uint i;
+	//判断光源是否在分组裁剪内
+	for (i = input.groupIndex; i < totalLightCount; i += NUM_THREADS)
+	{
+		switch (g_lights[i].type)
+		{
+		case  LIGHT_TYPE_DIRECTIONAL:
+		{
+			//添加灯光信息
+			AppendLight(i, lightCount, lightList);
+		}break;
+		case LIGHT_TYPE_SPOT:
+		{
+			//将光源信息转换为相机空间
+			float3 pos = worldToView(float4(g_lights[i].pos, 1.0)).xyz;
+			float3 dir = normalize(worldToView(float4(g_lights[i].direction, 0.0))).xyz;
+			pos.z *= -1;
+			dir.z *= -1;
+			float coneRadius = tan(0.5 * radians(g_lights[i].spotAngle)) * g_lights[i].range;
+
+			SCone cone = { pos, g_lights[i].range, dir, coneRadius };
+			if (coneInsideFrustum(cone, cluster))
+			{
+				AppendLight(i, lightCount, lightList);
+			}
+
+		}break;
+		case LIGHT_TYPE_POINT:
+		{
+			float3 lightPos = g_lights[i].pos;
+			float lightRange = g_lights[i].range;
+			SSphere s;
+			s.c = worldToView(float4(lightPos, 1.0)).xyz;
+			s.c.z *= -1.0;
+			s.r = lightRange;
+			if (sphereInsideFrustum(s, cluster))
+			{
+				AppendLight(i, lightCount, lightList);
+			}
+		}break;
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	//记录灯光数量
+	if (input.groupIndex == 0)
+	{
+		InterlockedAdd(g_pointLightIndexCounter[0], lightCount, lightStartOffset);
+		g_lightGrid[clusterIndex1d] = uint2(lightStartOffset, lightCount);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	//添加灯光信息
+	for (i = input.groupIndex; i < lightCount; i += NUM_THREADS)
+	{
+		g_lightIndexList[lightStartOffset + i] = lightList[i];
+	}
+
+}

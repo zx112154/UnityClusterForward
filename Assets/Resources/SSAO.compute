@@ -1,0 +1,116 @@
+﻿#pragma kernel SSAO
+
+RWTexture2D<float4> g_destTex;
+StructuredBuffer<float4> g_samples;
+StructuredBuffer<float3> g_noiseTex;
+
+Texture2D<float4> g_normalTex;
+Texture2D<float4> g_depthTex;
+
+
+float4x4 projectionMatrix;	//投影矩阵
+float4x4 invProjectionMatrix;	//逆投影矩阵
+float4 screenSize;
+float4 ProjectionParams;
+
+#define KERNELSIZE 64.0
+#define RADIUS 10.0
+
+float3 UnpackNormalMaxComponent(float3 n)
+{
+	return normalize(n * 2.0 - 1.0);
+}
+
+float4 clipToView(float4 cPos)
+{
+	float4 view = mul(invProjectionMatrix, cPos);
+	view = view / view.w;
+	return view;
+}
+
+//屏幕空间到视图空间
+float4 screenToView(float2 sPos)
+{
+	float2 uv = sPos * screenSize.zw;
+	float4 clip = float4(uv * 2.0 - 1.0, 1.0, 1.0);
+#if UNITY_UV_STARTS_AT_TOP
+	clip.y *= -1;
+#endif
+	return clipToView(clip);
+}
+
+float LinearEyeDepth(float z)
+{
+	z = 1 - z;
+	float n = ProjectionParams.y;
+	float f = ProjectionParams.z;
+	return -1 / ((n - f) / (n * f) * z + 1 / n);
+}
+
+//[numthreads(8, 8, 1)]
+//void SSAO(uint3 id : SV_DispatchThreadID)
+//{
+//	float4 vPos = screenToView(id.xy);	//当前像素的相机空间位置
+//	float depth = LinearEyeDepth(g_depthTex[id.xy].r);
+//	float ao = 0.0;
+//	for (int i = 0; i < KERNELSIZE; i++)
+//	{
+//		float3 samplePos = vPos.xyz + g_samples[i].xyz;
+//		float4 offset = float4(samplePos, 1.0);
+//		offset = mul(projectionMatrix, offset);
+//		offset.xy /= offset.w;
+//		offset.xy = offset.xy * 0.5 + 0.5;
+//		offset.xy *= screenSize.xy;
+//
+//		float sampleDepth = LinearEyeDepth(g_depthTex[offset.xy].r);
+//
+//		//ao += (sampleDepth >= samplePos.z ? 1.0 : 0.0);
+//		float rangeCheck = smoothstep(0.0, 1.0, RADIUS / (abs(depth - sampleDepth)));
+//		ao += (sampleDepth >= samplePos.z ? 1.0 : 0.0) * rangeCheck;
+//	}
+//	ao = ao / KERNELSIZE;	
+//	
+//	g_destTex[id.xy] = float4(ao, ao, ao, 1.0);
+//}
+
+[numthreads(8, 8, 1)]
+void SSAO(uint3 id : SV_DispatchThreadID)
+{
+	float4 vPos = screenToView(id.xy);	//当前像素的相机空间位置			
+	float3 normal = UnpackNormalMaxComponent(g_normalTex[id.xy].xyz);			//当前像素的法线相机空间位置
+	
+	float3 randomVec = g_noiseTex[(id.x + id.y * 4) % 16].xyz;	//随机旋转向量
+
+	//使用随机旋转切线
+	//构建变换矩阵：tangent - view
+	float3 tangent = normalize(randomVec - normal * dot(randomVec, normal));
+	float3 bitangent = cross(normal, tangent);
+	float3x3 TBN = float3x3(tangent, bitangent, normal);
+
+	//根据法线位置进行半球采样
+	float occlusion = 0.0;
+	for (int i = 0; i < KERNELSIZE; i++)
+	{
+		//获取随机采样点
+		float3 rSample = mul(TBN, g_samples[i].xyz);	//将随机采样点从切线空间变换到视图空间
+		rSample = vPos.xyz + rSample * RADIUS;
+
+		//获取采样点的真实深度
+		float4 offset = float4(rSample, 1.0);
+		offset = mul(projectionMatrix, offset);	//转换到投影空间
+
+		offset.xyz /= offset.w;	//转换为ndc空间
+		offset.xyz = offset.xyz * 0.5 + 0.5;
+		offset.xy *= screenSize.xy;
+
+		float sampleDepth = LinearEyeDepth(g_depthTex[offset.xy].r);
+
+		//范围检测
+		float rangeCheck = smoothstep(0.0, 1.0, RADIUS / (abs(vPos.z - sampleDepth)));
+		occlusion += (sampleDepth >= rSample.z ? 1.0 : 0.0) * rangeCheck;
+		//occlusion += (sampleDepth >= rSample.z ? 1.0 : 0.0);
+	}
+	occlusion = 1 - (occlusion / KERNELSIZE);
+
+	g_destTex[id.xy] = float4(occlusion, occlusion, occlusion, 1.0);
+}

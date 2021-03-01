@@ -1,0 +1,27 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 4566ea1dba39ec64c811e8b7e8bb3c53, type: 3}
+  m_Name: MyRendererPipeline
+  m_EditorClassIdentifier: 
+  m_shadowMapSize: 2048
+  m_shadowCascades: 4
+  m_twoCascadesSplit: 0.25
+  m_fourCascadesSplit: {x: 0.067, y: 0.2, z: 0.467}
+  clearColor: {r: 0, g: 0, b: 0, a: 0}
+  enableDynamicBatching: 0
+  enableInstancing: 1
+  shadowDistance: 100
+  defaultStack: {fileID: 0}
+  m_renderScale: 1
+  m_msaa: 4
+  m_allowHDR: 0
+  m_renderPath: 1

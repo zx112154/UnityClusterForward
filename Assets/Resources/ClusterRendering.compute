@@ -1,0 +1,118 @@
+﻿#pragma kernel ClusterCompute
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+struct SPlane
+{
+	float3 n;
+	float d;
+};
+
+//定义平截体
+struct SFrustum
+{
+	SPlane planes[4];
+	float2 nearFar;
+};
+
+struct CSInput
+{
+	uint3 groupId : SV_GroupID;						//线程组 ID（三维）	(表示当前线程属于的groupID)
+	uint3 dispatchThreadId : SV_DispatchThreadID;	//线程组内的线程唯一ID（三维） (表示当前线程在所有线程组中的ID)
+	uint3 groupThreadId : SV_GroupThreadID;			//线程组内的线程ID（三维）	（表示当前线程在当前线程组中的ID）
+	uint groupIndex : SV_GroupIndex;				//线程组内的线程ID （一维）	（表示当前线程在当前线程组中的一维ID）
+};
+
+//cs输出计算后的平截体
+RWStructuredBuffer<SFrustum> g_clusters;
+
+
+uint3 clusterCount;		//屏幕划分的数量
+uint2 clusterSize;		//屏幕划分的大小
+float2 nearFarPlane;	//相机远近裁剪面的距离
+float4 screenSize;		//屏幕大小
+float4x4 inverseProjectionMatrix;	//相机投影逆矩阵
+
+#define BLOCK_SIZE_XY 16
+#define BLOCK_SIZE_Z 4
+
+//将索引从三维转换为一维
+uint computeClusterIndex1d(uint3 _clusterIndex3D)
+{
+	return _clusterIndex3D.x + (clusterCount.x * (_clusterIndex3D.y + clusterCount.y * _clusterIndex3D.z));
+}
+
+//计算平截面
+SPlane computePlane(float3 p0, float3 p1, float3 p2)
+{
+	SPlane plane;
+	float3 v0 = p1 - p0;
+	float3 v1 = p2 - p0;
+	plane.n = normalize(cross(v0, v1));
+	plane.d = dot(plane.n, p0);
+	return plane;
+}
+
+//从裁剪平面到相机空间
+float4 clipToView(float4 p)
+{
+	float4 view = mul(inverseProjectionMatrix, p);
+	view = view / view.w;
+	return view;
+}
+
+//屏幕空间到视图空间转换
+float4 screenToView(float4 _p)
+{
+	float2 uv = _p.xy * screenSize.zw;
+	float4 clip = float4(uv * 2.0 - 1.0, _p.z, _p.w);	//将屏幕空间坐标转换到裁剪面上
+
+#if UNITY_UV_STARTS_AT_TOP
+	clip.y *= -1;
+#endif
+	return clipToView(clip);
+}
+
+[numthreads(BLOCK_SIZE_XY, BLOCK_SIZE_XY, BLOCK_SIZE_Z)]
+void ClusterCompute(CSInput input)
+{
+	//线程组的索引不能超过分块数量
+	if (input.dispatchThreadId.x < clusterCount.x &&
+		input.dispatchThreadId.y < clusterCount.y &&
+		input.dispatchThreadId.z < clusterCount.z)
+	{
+		//获取当前屏幕块的坐标
+		float4 posScreen[4];
+		posScreen[0] = float4(input.dispatchThreadId.xy * clusterSize, 1, 1.0);	//left bottom
+		posScreen[1] = float4((input.dispatchThreadId.xy + uint2(1, 0)) * clusterSize, 1, 1.0);	//right bottom
+		posScreen[2] = float4((input.dispatchThreadId.xy + uint2(0, 1)) * clusterSize, 1, 1.0);	//left top
+		posScreen[3] = float4((input.dispatchThreadId.xy + uint2(1, 1)) * clusterSize, 1, 1.0);	//right top
+
+		//将分块的的屏幕坐标转换为视图坐标
+		float3 posView[4];
+		for (int i = 0; i < 4; ++i)
+		{
+			posScreen[i].x = min(posScreen[i].x, screenSize.x);
+			posScreen[i].y = min(posScreen[i].y, screenSize.y);
+			posView[i] = screenToView(posScreen[i]).xyz;
+		}
+
+		//计算在分块在单个块里的远近裁剪面
+		float zNearView = lerp(nearFarPlane.x, nearFarPlane.y, (float)input.dispatchThreadId.z / clusterCount.z);
+		float zFarView = lerp(nearFarPlane.x, nearFarPlane.y, (float)(input.dispatchThreadId.z + 1) / clusterCount.z);
+
+		float3 eyeView = float3(0, 0, 0);
+		//计算平截体
+		SFrustum frustum;
+		frustum.planes[0] = computePlane(eyeView, posView[0], posView[2]);		//（原点， 左下， 左上）left
+		frustum.planes[1] = computePlane(eyeView, posView[3], posView[1]);		//right
+		frustum.planes[2] = computePlane(eyeView, posView[2], posView[3]);		//top
+		frustum.planes[3] = computePlane(eyeView, posView[0], posView[1]);		//bottom
+
+		frustum.nearFar = float2(-zNearView, -zFarView);
+
+		//将线程索引，转换为一维索引
+		uint clusterIndex = computeClusterIndex1d(input.dispatchThreadId);
+		g_clusters[clusterIndex] = frustum;
+	}
+}
